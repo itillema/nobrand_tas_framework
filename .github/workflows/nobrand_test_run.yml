@@ -1,0 +1,353 @@
+# Name of the workflow
+name: Build and Run No Brand Automated Playwright Test Solution
+
+# Controls when the workflow will run.
+on:
+  # Triggers the workflow on pull request events targeting the "main" branch.
+  pull_request:
+    branches: [ "main" ]
+  # Runs daily at 06:30 AM CST (12:30 UTC)
+  schedule:
+    - cron: '30 12 * * *'
+  
+# Workflow run, made up of jobs that can run sequentially or in parallel.
+jobs:
+  build-and-test:
+    # GitHub-hosted runners come with Chrome pre-installed.
+    runs-on: windows-latest
+    permissions:
+      checks: write
+      contents: read    # DASHBOARD: restore to `write` when re-enabling the "Publish run-summary" step below
+    steps:
+      # Step 1: Checks out the repository under $GITHUB_WORKSPACE, so your job can access it.
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      # Step 2: Sets up the .NET environment. Specify the version this project targets.
+      - name: Setup .NET
+        uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: '10.0.x'
+
+      # Step 3: Caches NuGet packages to speed up subsequent runs.
+      - name: Cache NuGet packages
+        uses: actions/cache@v4
+        with:
+          path: ~/.nuget/packages
+          key: ${{ runner.os }}-nuget-${{ hashFiles('**/*.csproj') }}
+          restore-keys: |
+            ${{ runner.os }}-nuget-
+
+
+      # Step 4: Restores the dependencies and tools of a project.
+      - name: Restore dependencies
+        run: dotnet restore
+
+      # Step 5: Builds the project and all of its dependencies.
+      - name: Build project
+        run: dotnet build --configuration Release --no-restore
+
+      # Step 5a: Caches the Playwright browser binaries to speed up subsequent runs.
+      - name: Cache Playwright browsers
+        uses: actions/cache@v4
+        with:
+          path: ~\AppData\Local\ms-playwright
+          key: ${{ runner.os }}-playwright-${{ hashFiles('**/*.csproj') }}
+          restore-keys: |
+            ${{ runner.os }}-playwright-
+
+      # Step 5b: Installs the Playwright-managed browser (Chromium) that Microsoft.Playwright drives.
+      # The install script is emitted to the test project's build output.
+      - name: Install Playwright browsers
+        run: pwsh Execution/bin/Release/net10.0/playwright.ps1 install chromium
+        shell: pwsh
+
+      # Step 6: Sets a global date variable for naming the test results uniquely.
+      - name: Set test results date variable
+        id: set_date
+        run: |
+          $date = Get-Date -Format "yyyyMMdd_HHmmss"
+          echo "date=$date" >> $env:GITHUB_ENV
+        shell: pwsh
+
+      # Step 7: Runs tests and generates a TRX results file.
+      - name: Run NUnit tests
+        id: tests # Give this step an ID to reference its outcome later
+        run: dotnet test nobrand_framework.sln --configuration Release --no-build --logger "trx;LogFileName=test-results-${{ env.date }}.trx" --collect:"XPlat Code Coverage"
+
+      # Step 8: Generates a markdown job summary from the TRX test results file.
+      - name: Generate GitHub Actions Job Summary
+        if: always()
+        shell: pwsh
+        run: |
+          # Find the TRX file
+          $trxFile = Get-ChildItem -Path . -Recurse -Filter "test-results-${{ env.date }}.trx" | Select-Object -First 1
+
+          if (-not $trxFile) {
+            $summary = @"
+          ## :warning: Test Results Summary
+
+          **Date:** ${{ env.date }}
+          **Status:** TRX results file not found. Tests may not have executed.
+          "@
+            $summary | Out-File -FilePath $env:GITHUB_STEP_SUMMARY -Encoding utf8
+            Write-Warning "TRX file not found."
+            exit 0
+          }
+
+          Write-Host "Found TRX file: $($trxFile.FullName)"
+
+          # Parse the TRX XML
+          [xml]$trx = Get-Content $trxFile.FullName
+
+          # Extract counters from ResultSummary
+          $counters = $trx.TestRun.ResultSummary.Counters
+          $total    = $counters.total
+          $passed   = $counters.passed
+          $failed   = $counters.failed
+          $executed = $counters.executed
+          $skipped  = [int]$total - [int]$executed
+          $outcome  = $trx.TestRun.ResultSummary.outcome
+
+          # Extract timing
+          $times = $trx.TestRun.Times
+          $startTime  = $times.start
+          $finishTime = $times.finish
+
+          # Determine status emoji based on outcome
+          if ($outcome -eq "Completed" -and [int]$failed -eq 0) {
+            $statusIcon = ":white_check_mark:"
+            $statusText = "All Tests Passed"
+          } elseif ([int]$failed -gt 0) {
+            $statusIcon = ":x:"
+            $statusText = "$failed Test(s) Failed"
+          } else {
+            $statusIcon = ":warning:"
+            $statusText = "Outcome: $outcome"
+          }
+
+          # Build the summary markdown
+          $summary = @"
+          ## $statusIcon Test Results Summary
+
+          | Property | Value |
+          |----------|-------|
+          | **Run Date** | ${{ env.date }} |
+          | **Environment** | CI (GitHub Actions) |
+          | **Runner** | windows-latest |
+          | **Outcome** | $outcome |
+          | **Start** | $startTime |
+          | **Finish** | $finishTime |
+
+          ### Test Counts
+
+          | Total | :white_check_mark: Passed | :x: Failed | :fast_forward: Skipped |
+          |:-----:|:-------:|:------:|:-------:|
+          | $total | $passed | $failed | $skipped |
+
+          "@
+
+          # If there are failures, list them
+          if ([int]$failed -gt 0) {
+            $failedTests = $trx.TestRun.Results.UnitTestResult | Where-Object { $_.outcome -eq "Failed" }
+            $summary += "`n### :x: Failed Tests`n`n"
+            foreach ($ft in $failedTests) {
+              $testName = $ft.testName
+              $errorMsg = $ft.Output.ErrorInfo.Message
+              if ($errorMsg.Length -gt 200) { $errorMsg = $errorMsg.Substring(0, 200) + "..." }
+              $summary += "- **$testName**`n  > $errorMsg`n`n"
+            }
+          }
+
+          $summary += "> Generated by CI pipeline on ``${{ github.sha }}`` (``${{ github.ref_name }}``)"
+
+          $summary | Out-File -FilePath $env:GITHUB_STEP_SUMMARY -Encoding utf8
+          Write-Host "Job summary written successfully."
+
+      # Step 9: Publishes the test results to the Job Summary page. This step runs even if the test step fails, ensuring a report is always generated.
+      - name: Publish Test Results
+        uses: dorny/test-reporter@v1
+        if: always() # Ensures this step runs even if the tests fail
+        with:
+          name: Automated Test Results-${{ env.date }} # Name of the report
+          path: '**/test-results-${{ env.date }}.trx' # Path to the TRX file(s)
+          reporter: dotnet-trx # The format of the report
+
+      # Step 9: Uploads the raw test results file as an artifact.
+      - name: Upload test results artifact
+        uses: actions/upload-artifact@v4
+        if: always() # Also run this step on failure
+        with:
+          name: test-results-${{ env.date }}
+          path: '**/test-results-${{ env.date }}.trx'
+          retention-days: 30 # Retain the artifact for 30 days
+
+      # Step 12: Uploads Serilog test run logs as an artifact.
+      - name: Upload Serilog test logs
+        uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: serilog-test-logs-${{ env.date }}
+          path: '**/Logs/*.log'
+          retention-days: 30
+          if-no-files-found: warn
+
+      # Step 13: Uploads the ExtentReports HTML report as an artifact.
+      - name: Upload ExtentReports HTML report
+        uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: extent-report-${{ env.date }}
+          path: '**/Reports/TestExecutionReport_*.html'
+          retention-days: 30
+          if-no-files-found: warn
+
+      # Step 13a: Converts the ExtentReports HTML to PDF using headless Chrome (pre-installed on windows-latest).
+      - name: Convert ExtentReport HTML to PDF
+        if: always()
+        shell: pwsh
+        run: |
+          $reportFile = Get-ChildItem -Path . -Recurse -Filter "TestExecutionReport_*.html" |
+                        Sort-Object LastWriteTime -Descending | Select-Object -First 1
+
+          if (-not $reportFile) {
+            Write-Warning "No ExtentReport HTML file found. Skipping PDF generation."
+            exit 0
+          }
+
+          Write-Host "Found report: $($reportFile.FullName)"
+
+          # Inject expand-all script before </body>. Spark uses Bootstrap collapse classes.
+          $expandScript = @'
+          <script>
+          window.addEventListener('load', function() {
+            setTimeout(function() {
+              document.querySelectorAll('.collapse').forEach(function(el) {
+                el.classList.add('show');
+              });
+              document.querySelectorAll('[aria-expanded="false"]').forEach(function(el) {
+                el.setAttribute('aria-expanded', 'true');
+              });
+            }, 500);
+          });
+          </script>
+          '@
+
+          $html = Get-Content $reportFile.FullName -Raw
+          $html = $html -replace '</body>', "$expandScript</body>"
+          $printableHtml = [System.IO.Path]::ChangeExtension($reportFile.FullName, '.print.html')
+          Set-Content -Path $printableHtml -Value $html -Encoding utf8
+
+          $chrome = "C:\Program Files\Google\Chrome\Application\chrome.exe"
+          if (-not (Test-Path $chrome)) {
+            $chrome = "C:\Program Files (x86)\Google\Chrome\Application\chrome.exe"
+          }
+          if (-not (Test-Path $chrome)) {
+            Write-Warning "Chrome not found. Skipping PDF generation."
+            exit 0
+          }
+
+          $pdfPath = [System.IO.Path]::ChangeExtension($reportFile.FullName, '.pdf')
+          $fileUri = ([System.Uri]$printableHtml).AbsoluteUri
+
+          & $chrome `
+            --headless=new `
+            --disable-gpu `
+            --no-sandbox `
+            --run-all-compositor-stages-before-draw `
+            --virtual-time-budget=10000 `
+            "--print-to-pdf=$pdfPath" `
+            "--print-to-pdf-no-header" `
+            $fileUri
+
+          if (Test-Path $pdfPath) {
+            Write-Host "PDF generated: $pdfPath"
+            Remove-Item $printableHtml -Force
+          } else {
+            Write-Warning "Chrome did not produce a PDF."
+            exit 0
+          }
+
+      # Step 13b: Uploads the ExtentReports PDF report as an artifact.
+      - name: Upload ExtentReports PDF report
+        uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: extent-report-pdf-${{ env.date }}
+          path: '**/Reports/TestExecutionReport_*.pdf'
+          retention-days: 30
+          if-no-files-found: warn
+
+      # Step 14: Uploads the code coverage report as an artifact.
+      - name: Upload code coverage report
+        uses: actions/upload-artifact@v4
+        with:
+          name: code-coverage-report
+          path: '**/coverage.cobertura.xml'
+
+      # Step 15: Installs ReportGenerator and converts Cobertura XML to HTML coverage report.
+      - name: Generate HTML coverage report
+        if: success()
+        shell: pwsh
+        run: |
+          dotnet tool install --global dotnet-reportgenerator-globaltool
+
+          $coberturaFile = Get-ChildItem -Path . -Recurse -Filter "coverage.cobertura.xml" | Select-Object -First 1
+
+          if (-not $coberturaFile) {
+            Write-Warning "No Cobertura coverage file found. Skipping report generation."
+            exit 0
+          }
+
+          Write-Host "Found coverage file: $($coberturaFile.FullName)"
+
+          reportgenerator `
+            "-reports:$($coberturaFile.FullName)" `
+            "-targetdir:coverage-report" `
+            "-reporttypes:HtmlInline_AzurePipelines;TextSummary"
+
+          Write-Host "Coverage report generated in coverage-report/"
+
+      # Step 16: Uploads the HTML coverage report as a downloadable artifact.
+      - name: Upload HTML coverage report
+        uses: actions/upload-artifact@v4
+        if: success()
+        with:
+          name: coverage-report-html-${{ env.date }}
+          path: coverage-report/
+          retention-days: 30
+          if-no-files-found: warn
+
+      # Step 17: Appends coverage summary to the GitHub Actions Job Summary.
+      - name: Append coverage to Job Summary
+        if: success()
+        shell: pwsh
+        run: |
+          $summaryFile = "coverage-report/Summary.txt"
+          if (Test-Path $summaryFile) {
+            $summaryContent = Get-Content $summaryFile -Raw
+
+            $lineCoverage = if ($summaryContent -match "Line coverage:\s*([\d.]+)%") { $Matches[1] } else { "N/A" }
+            $branchCoverage = if ($summaryContent -match "Branch coverage:\s*([\d.]+)%") { $Matches[1] } else { "N/A" }
+
+            $coverageSummary = @"
+
+          ---
+
+          ## :bar_chart: Code Coverage Summary
+
+          | Metric | Coverage |
+          |--------|----------|
+          | **Line Coverage** | $lineCoverage% |
+          | **Branch Coverage** | $branchCoverage% |
+
+          > Full HTML coverage report available in the **coverage-report-html-${{ env.date }}** artifact.
+          "@
+
+            $coverageSummary | Out-File -FilePath $env:GITHUB_STEP_SUMMARY -Append -Encoding utf8
+            Write-Host "Coverage summary appended to job summary."
+          } else {
+            Write-Warning "Coverage summary file not found. Skipping."
+          }
+
+

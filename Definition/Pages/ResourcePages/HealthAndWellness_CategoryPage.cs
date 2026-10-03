@@ -1,0 +1,40 @@
+﻿using Microsoft.Playwright;
+using Serilog;
+using static Microsoft.Playwright.Assertions;
+
+namespace Definition.Pages.ResourcePages
+{
+    public class HealthAndWellness_CategoryPage(IPage page, ILogger logger)
+    {
+        //-- Page Elements --//
+        private ILocator PageH1Heading_Text => page.Locator("xpath=//div[@class='blog-listing-hero__content']//h1[text()='Health & Wellness']").First;
+
+
+
+        //-- Page Methods --//
+
+
+        /// <summary>
+        ///     Verify that the Health and Wellness resource category page loads as expected.
+        /// </summary>
+        /// <returns>
+        ///     Boolean value indicating if the Health and Wellness resource category page heading is visible.
+        /// </returns>
+        public async Task<bool> LoadHealthAndWellnessPage_VerifyHeading()
+        {
+            logger.Information("    Verifying heading is displayed on page...");
+            try
+            {
+                await Expect(PageH1Heading_Text.First).ToBeVisibleAsync();
+                logger.Information("    Heading is displayed on page.");
+                return true;
+            }
+            catch (Exception ex)
+            {
+                logger.Error(ex, "    Failed to verify heading is displayed on the page.");
+                return false;
+            }
+        }
+    }
+}
+

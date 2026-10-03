@@ -1,0 +1,9 @@
+<Solution>
+  <Folder Name="/Solution Items/">
+    <File Path="ReadMe.md" />
+  </Folder>
+  <Project Path="Adaptation/Adaptation.csproj" />
+  <Project Path="Definition/Definition.csproj" />
+  <Project Path="Execution/Execution.csproj" />
+  <Project Path="Utility/Utility.csproj" />
+</Solution>
